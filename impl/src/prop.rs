@@ -25,7 +25,12 @@ impl Struct<'_> {
 
     pub(crate) fn distinct_backtrace_field(&self) -> Option<&Field> {
         let backtrace_field = self.backtrace_field()?;
-        distinct_backtrace_field(backtrace_field, self.from_field())
+        field_if_distinct_from(backtrace_field, self.from_field())
+    }
+
+    pub(crate) fn distinct_location_field(&self) -> Option<&Field> {
+        let location_field = self.location_field()?;
+        field_if_distinct_from(location_field, self.from_field())
     }
 }
 
@@ -40,6 +45,12 @@ impl Enum<'_> {
         self.variants
             .iter()
             .any(|variant| variant.backtrace_field().is_some())
+    }
+
+    pub(crate) fn has_location(&self) -> bool {
+        self.variants
+            .iter()
+            .any(|variant| variant.location_field().is_some())
     }
 
     pub(crate) fn has_display(&self) -> bool {
@@ -76,7 +87,12 @@ impl Variant<'_> {
 
     pub(crate) fn distinct_backtrace_field(&self) -> Option<&Field> {
         let backtrace_field = self.backtrace_field()?;
-        distinct_backtrace_field(backtrace_field, self.from_field())
+        field_if_distinct_from(backtrace_field, self.from_field())
+    }
+
+    pub(crate) fn distinct_location_field(&self) -> Option<&Field> {
+        let location_field = self.location_field()?;
+        field_if_distinct_from(location_field, self.from_field())
     }
 }
 
@@ -153,16 +169,14 @@ fn location_field<'a, 'b>(fields: &'a [Field<'b>]) -> Option<&'a Field<'b>> {
 }
 
 // The #[backtrace] field, if it is not the same as the #[from] field.
-fn distinct_backtrace_field<'a, 'b>(
-    backtrace_field: &'a Field<'b>,
-    from_field: Option<&Field>,
+fn field_if_distinct_from<'a, 'b>(
+    input_field: &'a Field<'b>,
+    check_against: Option<&Field>,
 ) -> Option<&'a Field<'b>> {
-    if from_field.map_or(false, |from_field| {
-        from_field.member == backtrace_field.member
-    }) {
+    if check_against.map_or(false, |from_field| from_field.member == input_field.member) {
         None
     } else {
-        Some(backtrace_field)
+        Some(input_field)
     }
 }
 

@@ -70,23 +70,15 @@ fn impl_struct(input: Struct) -> TokenStream {
         }
     });
 
-    let provide_method = input.backtrace_field().map(|backtrace_field| {
+    let backtrace_field = input.backtrace_field();
+    let location_field = input.location_field();
+    let provide_method = (backtrace_field.is_some() || location_field.is_some()).then(||{
+        
         let request = quote!(request);
-        let backtrace = &backtrace_field.member;
-        let body = if let Some(source_field) = input.source_field() {
-            let source = &source_field.member;
-            let source_provide = if type_is_option(source_field.ty) {
-                quote_spanned! {source.span()=>
-                    if let ::core::option::Option::Some(source) = &self.#source {
-                        source.thiserror_provide(#request);
-                    }
-                }
-            } else {
-                quote_spanned! {source.span()=>
-                    self.#source.thiserror_provide(#request);
-                }
-            };
-            let self_provide = if source == backtrace {
+
+        let backtrace_provide = if let Some(backtrace_field) = backtrace_field {
+            let backtrace = &backtrace_field.member;
+            if matches!(input.source_field(), Some(source_field) if &source_field.member == backtrace) {
                 None
             } else if type_is_option(backtrace_field.ty) {
                 Some(quote! {
@@ -98,46 +90,51 @@ fn impl_struct(input: Struct) -> TokenStream {
                 Some(quote! {
                     #request.provide_ref::<::thiserror::__private::Backtrace>(&self.#backtrace);
                 })
-            };
-            let location_provide = if let Some(location_field) = input.location_field() {
-                let location = &location_field.member;
-
-                if type_is_option(location_field.ty) {
-                    Some(quote! {
-                        if let ::core::option::Option::Some(location) = &self.#location {
-                            #request.provide_ref::<::core::panic::Location>(location);
-                        }
-                    })
-                } else {
-                    Some(quote! {
-                        #request.provide_ref::<::core::panic::Location>(&self.#location);
-                    })
-                }
-            } else {
+                
+            }
+        } else { None };
+        let location_provide = if let Some(location_field) = location_field {
+            let location = &location_field.member;
+            if matches!(input.source_field(), Some(source_field) if &source_field.member == location) {
                 None
-            };
-            quote! {
-                use ::thiserror::__private::ThiserrorProvide as _;
-                #source_provide
-                #self_provide
-                #location_provide
+            } else if type_is_option(location_field.ty) {
+                Some(quote! {
+                    if let ::core::option::Option::Some(location) = &self.#location {
+                        #request.provide_ref::<::core::panic::Location<'static>>(location);
+                    }
+                })
+            } else {
+                Some(quote! {
+                    #request.provide_ref::<::core::panic::Location<'static>>(&self.#location);
+                })
+                
             }
-        } else if type_is_option(backtrace_field.ty) {
-            quote! {
-                if let ::core::option::Option::Some(backtrace) = &self.#backtrace {
-                    #request.provide_ref::<::thiserror::__private::Backtrace>(backtrace);
-                }
+        } else { None };
+
+        let source_provide = if let Some(source_field) = input.source_field() {
+            let source = &source_field.member;
+            if type_is_option(source_field.ty) {
+                Some(quote_spanned! {source.span()=>
+                    if let ::core::option::Option::Some(source) = &self.#source {
+                        source.thiserror_provide(#request);
+                    }
+                })
+            } else {
+                Some(quote_spanned! {source.span()=>
+                    self.#source.thiserror_provide(#request);
+                })
             }
-        } else {
-            quote! {
-                #request.provide_ref::<::thiserror::__private::Backtrace>(&self.#backtrace);
-            }
-        };
+        } else { None };
+        
         quote! {
             fn provide<'_request>(&'_request self, #request: &mut ::core::error::Request<'_request>) {
-                #body
+                use ::thiserror::__private::ThiserrorProvide as _;
+                #source_provide
+                #backtrace_provide
+                #location_provide
             }
         }
+    
     });
 
     let mut display_implied_bounds = Set::new();
@@ -184,15 +181,11 @@ fn impl_struct(input: Struct) -> TokenStream {
     let from_impl = input.from_field().map(|from_field| {
         let span = from_field.attrs.from.unwrap().span;
         let backtrace_field = input.distinct_backtrace_field();
+        let location_field = input.distinct_location_field();
         let from = unoptional_type(from_field.ty);
-        let track_caller = input.location_field().map(|_| quote!(#[track_caller]));
+        let track_caller = location_field.as_ref().map(|_| quote!(#[track_caller]));
         let source_var = Ident::new("source", span);
-        let body = from_initializer(
-            from_field,
-            backtrace_field,
-            &source_var,
-            input.location_field(),
-        );
+        let body = from_initializer(from_field, backtrace_field, &source_var, location_field);
         let from_function = quote! {
             #track_caller
             fn from(#source_var: #from) -> Self {
@@ -287,101 +280,73 @@ fn impl_enum(input: Enum) -> TokenStream {
         None
     };
 
-    let provide_method = if input.has_backtrace() {
+    let provide_method = if input.has_backtrace() || input.has_location() {
         let request = quote!(request);
         let arms = input.variants.iter().map(|variant| {
             let ident = &variant.ident;
 
-            let mut arm = vec![];
             let mut head = vec![];
+            let source_field = variant.source_field();
+            let backtrace_field = variant.backtrace_field();
+            let location_field = variant.location_field();
 
-            if let Some((source_field, backtrace_field)) = variant
-                .backtrace_field()
-                .and_then(|b| variant.source_field().take().map(|s| (s, b)))
-                .and_then(|(s, b)| {
-                    // TODO: replace with take_if upon stabilization
-
-                    if s.member == b.member {
-                        Some((s, b))
-                    } else {
-                        None
-                    }
-                })
-            {
+            let backtrace_provide = if let Some(backtrace_field) = backtrace_field {
                 let backtrace = &backtrace_field.member;
-                let varsource = quote!(source);
-                let source_provide = if type_is_option(source_field.ty) {
-                    quote_spanned! {backtrace.span()=>
-                        if let ::core::option::Option::Some(source) = #varsource {
-                            source.thiserror_provide(#request);
-                        }
-                    }
+                if matches!(source_field, Some(source_field) if &source_field.member == backtrace) {
+                    None
                 } else {
-                    quote_spanned! {backtrace.span()=>
-                        #varsource.thiserror_provide(#request);
-                    }
-                };
-
-                head.push(quote! { #backtrace: #varsource });
-                arm.push(quote! { #source_provide });
-            } else {
-                if let Some(backtrace_field) = variant.backtrace_field() {
-                    let backtrace = &backtrace_field.member;
-                    let body = if type_is_option(backtrace_field.ty) {
-                        quote! {
+                    head.push(quote! { #backtrace: backtrace });
+                    if type_is_option(backtrace_field.ty) {
+                        Some(quote! {
                             if let ::core::option::Option::Some(backtrace) = backtrace {
                                 #request.provide_ref::<::thiserror::__private::Backtrace>(backtrace);
                             }
-                        }
+                        })
                     } else {
-                        quote! {
+                        Some(quote! {
                             #request.provide_ref::<::thiserror::__private::Backtrace>(backtrace);
-                        }
-                    };
-
-                    head.push(quote! { #backtrace: backtrace });
-                    arm.push(quote! { #body });
+                        })
+                    }
                 }
+            } else { None };
 
-                if let Some(source_field) = variant.source_field() {
+            let location_provide = if let Some(location_field) = location_field {
+                let location = &location_field.member;
+                if matches!(source_field, Some(source_field) if &source_field.member == location) {
+                    None
+                } else {
+                    head.push(quote! { #location: location });
+                    if type_is_option(location_field.ty) {
+                        Some(quote! {
+                            if let ::core::option::Option::Some(location) = location {
+                                #request.provide_ref::<::core::panic::Location<'static>>(location);
+                            }
+                        })
+                    } else {
+                        Some(quote! {
+                            #request.provide_ref::<::core::panic::Location<'static>>(location);
+                        })
+                    }
+                }
+            } else { None };
+
+            let source_provide = if let Some(source_field) = source_field {
+                if backtrace_field.is_some() || location_field.is_some() {
                     let source = &source_field.member;
-                    let varsource = quote!(source);
-
-                    let source_provide = if type_is_option(source_field.ty) {
-                        quote_spanned! {source.span()=>
-                            if let ::core::option::Option::Some(source) = #varsource {
+                    head.push(quote! { #source: source });
+                    if type_is_option(source_field.ty) {
+                        Some(quote_spanned! {source.span()=>
+                            if let ::core::option::Option::Some(source) = source {
                                 source.thiserror_provide(#request);
                             }
-                        }
+                        })
                     } else {
-                        quote_spanned! {source.span()=>
-                            #varsource.thiserror_provide(#request);
-                        }
-                    };
-
-                    head.push(quote! { #source: #varsource });
-                    arm.push(quote! { #source_provide });
-                }
-            }
-
-            if let Some(location_field) = variant.location_field() {
-                let location = &location_field.member;
-
-                let location_provide = if type_is_option(location_field.ty) {
-                    quote! {
-                        if let ::core::option::Option::Some(location) = location {
-                            #request.provide_ref::<::core::panic::Location>(location);
-                        }
+                        Some(quote_spanned! {source.span()=>
+                            source.thiserror_provide(#request);
+                        })
                     }
-                } else {
-                    quote! {
-                        #request.provide_ref::<::core::panic::Location>(location);
-                    }
-                };
-
-                head.push(quote! { #location: location });
-                arm.push(quote! { #location_provide });
-            }
+                } else { None }
+            } else { None };
 
             quote! {
                 #ty::#ident {
@@ -389,7 +354,9 @@ fn impl_enum(input: Enum) -> TokenStream {
                     ..
                 } => {
                     use thiserror::__private::ThiserrorProvide as _;
-                    #(#arm)*
+                    #source_provide
+                    #backtrace_provide
+                    #location_provide
                 }
             }
         });
@@ -474,7 +441,7 @@ fn impl_enum(input: Enum) -> TokenStream {
         let from_field = variant.from_field()?;
         let span = from_field.attrs.from.unwrap().span;
         let backtrace_field = variant.distinct_backtrace_field();
-        let location_field = variant.location_field();
+        let location_field = variant.distinct_location_field();
         let variant = &variant.ident;
         let from = unoptional_type(from_field.ty);
         let source_var = Ident::new("source", span);
